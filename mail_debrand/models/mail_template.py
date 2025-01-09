@@ -4,65 +4,122 @@
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 import re
 
-from lxml import html as htmltree
+from lxml import etree, html
+from markupsafe import Markup
 
-from odoo import _, api, models
+from odoo import _, api, models, tools
 
 
 class MailTemplate(models.Model):
     _inherit = "mail.template"
 
-    @api.model
-    def _debrand_translated_words(self):
-        def _get_translated(word):
-            return self.env["ir.translation"]._get_source(
-                "ir.ui.view,arch_db", "model_terms", lang, word
+    def remove_href_odoo(
+        self, value, remove_parent=True, remove_before=False, to_keep=None
+    ):
+        if len(value) < 20:
+            return value
+        # value can be bytes type; ensure we get a proper string
+        if type(value) is bytes:
+            value = value.decode()
+        has_odoo_link = re.search(r"<a\s(.*)odoo\.com", value, flags=re.IGNORECASE)
+        extra_regex_to_skip = (
+            self.env["ir.config_parameter"]
+            .sudo()
+            .get_param("mail_debrand.extra_regex_to_skip", "False")
+        )
+        # value is required field on ir config_parameter, so we have added
+        # safety check for "False"
+        if (
+            has_odoo_link
+            and extra_regex_to_skip
+            and extra_regex_to_skip.strip().lower() != "false"
+        ):
+            # check each regex to be skipped
+            for regex in extra_regex_to_skip.split(","):
+                if re.search(r"{}".format(regex), value, flags=re.IGNORECASE):
+                    has_odoo_link = False
+                    break
+        if has_odoo_link:
+            # We don't want to change what was explicitly added in the message body,
+            # so we will only change what is before and after it.
+            if to_keep:
+                value = value.replace(to_keep, "<body_msg></body_msg>")
+            tree = html.fromstring(value)
+            odoo_anchors = tree.xpath('//a[contains(@href,"odoo.com")]')
+            for elem in odoo_anchors:
+                parent = elem.getparent()
+                previous = elem.getprevious()
+                if remove_before and not remove_parent and previous is not None:
+                    # remove 'using' that is before <a and after </span>
+                    previous.tail = ""
+                if remove_parent and len(parent.getparent()):
+                    if previous is not None and previous.tag == "br":
+                        # remove odoo tour info
+                        # todo remove previous and next tag with generic claims
+                        parent.remove(elem)
+                        previous.getparent().remove(previous)
+                    else:
+                        # anchor <a href odoo has a parent powered by that must be
+                        # removed
+                        parent.getparent().remove(parent)
+                else:
+                    if parent.tag == "td":  # also here can be powered by
+                        parent.getparent().remove(parent)
+                    else:
+                        parent.remove(elem)
+            value = etree.tostring(
+                tree, pretty_print=True, method="html", encoding="unicode"
             )
-
-        lang = self.env.lang
-        template_lang = self._get_template_lang()
-        if template_lang and template_lang != lang:
-            lang = template_lang
-
-        odoo_word = _get_translated("Odoo") or _("Odoo")
-        powered_by = _get_translated("Powered by") or _("Powered by")
-        using_word = _get_translated("using") or _("using")
-        return odoo_word, powered_by, using_word
+            if to_keep:
+                value = value.replace("<body_msg></body_msg>", to_keep)
+        return value
 
     @api.model
-    def _debrand_body(self, html):
-        odoo_word, powered_by, using_word = self._debrand_translated_words()
-        html = re.sub(using_word + "(.*)[\r\n]*(.*)>" + odoo_word + r"</a>", "", html)
-        if powered_by not in html:
-            return html
-        root = htmltree.fromstring(html)
-        powered_by_elements = root.xpath("//*[text()[contains(.,'%s')]]" % powered_by)
-        for elem in powered_by_elements:
-            # make sure it isn't a spurious powered by
-            if any(
-                [
-                    "www.odoo.com" in child.get("href", "")
-                    for child in elem.getchildren()
-                ]
-            ):
-                for child in elem.getchildren():
-                    elem.remove(child)
-                elem.text = None
-        return htmltree.tostring(root).decode("utf-8")
+    def _render_template(
+        self,
+        template_txt, model, res_ids, post_process=False,
+    ):
+        """replace anything that is with odoo in templates
+        if is a <a that contains odoo will delete it completly
+        original:
+         Render the given string on records designed by model / res_ids using
+        the given rendering engine. Currently only jinja is supported.
 
-    @api.model
-    def render_post_process(self, html):
-        html = super().render_post_process(html)
-        return self._debrand_body(html)
+        :param str template_txt: template text to render (jinja) or  (qweb)
+          this could be cleaned but hey, we are in a rush
+        :param str model: model name of records on which we want to perform rendering
+        :param list res_ids: list of ids of records (all belonging to same model)
+        :param string engine: jinja
+        :param post_process: perform rendered str / html post processing (see
+          ``_render_template_postprocess``)
 
-    def _get_template_lang(self):
-        template_lang = False
-        if self._context.get("default_template_id"):
-            template = self.env["mail.template"].browse(
-                self._context.get("default_template_id")
-            )
-            if template.lang and self._context.get("active_id"):
-                template_lang = template._render_template(
-                    template.lang, template.model, self._context.get("active_id")
-                )
-        return template_lang
+        :return dict: {res_id: string of rendered template based on record}"""
+        orginal_rendered = super()._render_template(
+            template_txt,
+            model,
+            res_ids,
+            post_process=post_process,
+        )
+        if isinstance(orginal_rendered, str):
+            return orginal_rendered
+
+        if isinstance(res_ids, int):
+            res_ids = [res_ids]
+        for key in res_ids:
+            orginal_rendered[key] = self.remove_href_odoo(orginal_rendered[key])
+
+        return orginal_rendered
+
+    def _replace_local_links(self, html, base_url=None):
+        message = super()._replace_local_links(html, base_url=base_url)
+
+        wrapper = Markup if isinstance(message, Markup) else str
+        message = tools.ustr(message)
+        if isinstance(message, Markup):
+            wrapper = Markup
+
+        message = re.sub(
+            r"""(Powered by\s(.*)Odoo</a>)""", "<div>&nbsp;</div>", message
+        )
+
+        return wrapper(message)
